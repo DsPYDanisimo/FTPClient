@@ -3,6 +3,7 @@ from PyQt5.QtGui import QIcon
 import ftplib
 import os
 
+
 class FTPFileModel(QAbstractItemModel):
     def __init__(self, ftp_client, root_path="/", ftp=None):
         super().__init__()
@@ -11,10 +12,8 @@ class FTPFileModel(QAbstractItemModel):
         self.file_list = []
         self.columns = ["Имя", "Размер", "Дата изменения", "Тип"]
         self.ftp = ftp
-        self.parent_path = None
 
-        # Загрузка иконок
-        self.folder_icon = QIcon("pictures/folder.png")  # Убедитесь, что пути к иконкам верны
+        self.folder_icon = QIcon("pictures/folder.png")
         self.config_icon = QIcon("pictures/config.png")
         self.excel_icon = QIcon("pictures/excel.png")
         self.newfile_icon = QIcon("pictures/Newfile.png")
@@ -25,57 +24,71 @@ class FTPFileModel(QAbstractItemModel):
         self.load_data()
 
     def load_data(self):
-        #print(f"load_data() вызвана для: {self.root_path}")
         if self.ftp is None:
-            print("Соединение с FTP-сервером потеряно.")
-            return  # Или вызовите функцию переподключения
-        self.beginResetModel()
-        self.file_list = []
-        temp_list = []  # Временный список для хранения необработанных данных
-
-        try:
-            self.ftp.retrlines("LIST " + self.root_path, lambda line: temp_list.append(line)) # Собираем строки в temp_list
-            #print("Содержимое temp_list после retrlines:", temp_list)
-        except ftplib.error_perm as e:
-            print(f"Ошибка доступа к директории: {e}")
-        except Exception as e:
-            print(f"Ошибка при получении списка файлов: {e}")
-
-        # В serv_FM.py, внутри FTPFileModel.load_data() перед циклом for line in temp_list:
-        print("Полный вывод LIST:")
-        for line in temp_list:
-            print(line)
-
-        # Обрабатываем строки из temp_list
-        for line in temp_list:
-            self.process_ftp_line(line)
-
-        # Сортировка: сначала директории, потом файлы, по имени
-        self.file_list.sort(key=lambda x: (not x['is_dir'], x['name'].lower())) # Сортировка по директориям, а затем по имени файла
-
-        # Добавляем элемент ".." для возврата на уровень выше, если это не корневая директория
-        if self.root_path != '/':
-            self.file_list.insert(0, {'name': '..', 'size': 0, 'last_modified': '', 'is_dir': True})
-
-        #print("Содержимое file_list после сортировки:", self.file_list)
-        self.endResetModel()
-
-    def process_ftp_line(self, line):
-        print("Получена строка LIST:", line)
-        parts = line.split(None, 8)  # Разделяем на 9 частей (включая права доступа)
-        if len(parts) < 9:
-            print("Неверный формат строки LIST:", line)
             return
 
-        permissions, _, owner, group, size, month, day, time, name = parts
-        is_dir = permissions.startswith('d')  # Проверяем, начинается ли строка прав с 'd'
+        self.beginResetModel()
+        self.file_list = []
+        
         try:
-            size = int(size)
-        except ValueError:
-            print("Неверный формат размера файла:", size)
+            # Получаем текущую директорию
+            current_dir = self.ftp.pwd()
+            
+            # Пытаемся перейти в целевую директорию
+            try:
+                if self.root_path != current_dir:
+                    self.ftp.cwd(self.root_path)
+            except ftplib.error_perm as e:
+                print(f"Не удалось перейти в {self.root_path}: {e}")
+                self.endResetModel()
+                return
+
+            lines = []
+            try:
+                self.ftp.retrlines('LIST', lambda x: lines.append(x))
+            except ftplib.error_perm as e:
+                print(f"Ошибка LIST: {e}")
+                self.endResetModel()
+                return
+
+            for line in lines:
+                try:
+                    self.process_ftp_line(line)
+                except Exception as e:
+                    print(f"Ошибка обработки строки: {e}")
+                    continue
+
+            # Сортировка: сначала директории, потом файлы
+            self.file_list.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+
+            # Добавляем ".." если не в корне
+            if self.root_path != '/':
+                self.file_list.insert(0, {
+                    'name': '..',
+                    'size': 0,
+                    'last_modified': '',
+                    'is_dir': True
+                })
+
+        except Exception as e:
+            print(f"Критическая ошибка при загрузке данных: {e}")
+        finally:
+            self.endResetModel()
+
+
+    def process_ftp_line(self, line):
+        parts = line.split()
+        if len(parts) < 6:
+            raise ValueError(f"Неверный формат строки LIST: {line}")
+
+        is_dir = parts[0].startswith('d')
+        try:
+            size = int(parts[4]) if not is_dir else 0
+        except (IndexError, ValueError):
             size = 0
 
-        last_modified = f"{month} {day} {time}"
+        last_modified = ' '.join(parts[5:8]) if len(parts) >= 8 else ''
+        name = ' '.join(parts[8:]) if len(parts) > 8 else parts[-1]
 
         self.file_list.append({
             'name': name,
@@ -83,7 +96,6 @@ class FTPFileModel(QAbstractItemModel):
             'last_modified': last_modified,
             'is_dir': is_dir
         })
-
 
     def rowCount(self, parent=QModelIndex()):
         if parent.isValid():
@@ -98,10 +110,7 @@ class FTPFileModel(QAbstractItemModel):
             return QVariant()
 
         row = index.row()
-        col = index.column()
-
         if row < 0 or row >= len(self.file_list):
-            print("Неверный индекс строки:", row)
             return QVariant()
 
         file_info = self.file_list[row]
@@ -109,38 +118,33 @@ class FTPFileModel(QAbstractItemModel):
         is_dir = file_info['is_dir']
 
         if role == Qt.DisplayRole:
-            if col == 0:  # Имя
+            col = index.column()
+            if col == 0:
                 return name
-            elif col == 1:  # Размер
-                if is_dir:
-                    return "<DIR>"
-                else:
-                    return str(file_info['size']) + " bytes"
-            elif col == 2:  # Дата изменения
+            elif col == 1:
+                return "<DIR>" if is_dir else f"{file_info['size']} bytes"
+            elif col == 2:
                 return file_info['last_modified']
-            elif col == 3:  # Тип
+            elif col == 3:
                 return "Directory" if is_dir else "File"
-        elif role == Qt.DecorationRole and col == 0:  # Иконка
+        elif role == Qt.DecorationRole and index.column() == 0:
             if name == '..':
-                # Возвращаем иконку для возврата на уровень выше
                 return QIcon('pictures/back.png')
             if is_dir:
                 return self.folder_icon
-            else:
-                ext = os.path.splitext(name)[1].lower()  # Получаем расширение файла
 
-                if ext in (".dll", ".ini"):
-                    return self.config_icon
-                elif ext == ".xlsx":
-                    return self.excel_icon
-                elif ext == ".png":
-                    return self.png_icon
-                elif ext in (".txt"):
-                    return self.txt_icon
-                elif ext in (".doc", ".docx"):
-                    return self.word_icon
-                else:
-                    return self.newfile_icon
+            ext = os.path.splitext(name)[1].lower()
+            if ext in (".dll", ".ini"):
+                return self.config_icon
+            elif ext == ".xlsx":
+                return self.excel_icon
+            elif ext == ".png":
+                return self.png_icon
+            elif ext == ".txt":
+                return self.txt_icon
+            elif ext in (".doc", ".docx"):
+                return self.word_icon
+            return self.newfile_icon
 
         return QVariant()
 
@@ -158,6 +162,9 @@ class FTPFileModel(QAbstractItemModel):
         return QModelIndex()
 
     def change_root(self, path):
-        print(f"change_root вызвана с: {path}")
         self.root_path = path
+        self.load_data()
+
+    def refresh(self):
+        """Принудительное обновление списка файлов"""
         self.load_data()
