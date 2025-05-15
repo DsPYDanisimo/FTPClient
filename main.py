@@ -1,6 +1,6 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTreeView, QFileSystemModel, QVBoxLayout, QWidget, QLineEdit, QPushButton, QMessageBox, QHBoxLayout, QLabel, QFrame, QProgressBar
-from PyQt5.QtCore import QDir, QSize, QTimer
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeView, QFileSystemModel,QVBoxLayout, QWidget, QLineEdit, QPushButton, QMessageBox, QHBoxLayout, QLabel, QDockWidget, QListWidget)
+from PyQt5.QtCore import QDir, QSize, QTimer, Qt
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QIcon
 import ftplib
 import os
@@ -8,13 +8,15 @@ import socket
 import sqlite3
 from serv_FM import FTPFileModel
 from Actions import Actions, Logger
-
-ftplib.DEBUGLEVEL = 0
-
+import tempfile
+import xlwt, xlrd
+from datetime import datetime
+import subprocess 
 
 class FTPClient(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Инициализация переменных
         self.ftp = None
         self.current_directory = '/'
         self.local_directory = QDir.homePath()
@@ -25,6 +27,12 @@ class FTPClient(QMainWindow):
         self.user = None
         self.host = None
         self.passw = None
+        self.is_admin = False
+        self.physical_ftp_path = '/'
+        self.connection_attempts = 0
+        self.max_retries = 3
+        self.user_dock = None
+        self.setup_user_panel()
         self.initUI()
 
     def initUI(self):
@@ -109,11 +117,11 @@ class FTPClient(QMainWindow):
 
         # Дополнительные кнопки
         self.button_report_history = QPushButton('Отчёт истории')
-        self.button_report = QPushButton('Отчёт')
+        self.button_report = QPushButton('Активные пользователи')
+        self.button_report.clicked.connect(self.show_active_users)
         self.button_report_history.setVisible(False)
         self.button_report.setVisible(False)
-        self.button_report_history.clicked.connect(self.open_history_report)
-        self.button_chat = QPushButton('Чат')
+        self.button_report_history.clicked.connect(self.show_history_report)
 
         # Основной layout
         main_layout = QVBoxLayout()
@@ -164,7 +172,6 @@ class FTPClient(QMainWindow):
         other_buttons_layout = QHBoxLayout()
         other_buttons_layout.addWidget(self.button_report)
         other_buttons_layout.addWidget(self.button_report_history)
-        other_buttons_layout.addWidget(self.button_chat)
         main_layout.addLayout(other_buttons_layout)
 
         # Установка главного виджета
@@ -182,89 +189,131 @@ class FTPClient(QMainWindow):
             with self.database as connection:
                 cursor = connection.cursor()
                 cursor.execute("SELECT ad_serv_host, admin_log, admin_psw FROM admin")
-                rows = cursor.fetchall()
-                for row in rows:
-                    hosts = row[0]
-                    logins = row[1]
-                    passwords = row[2]
-                    full_data = [hosts, logins, passwords]
-                    admin_data.append(full_data)
+                admin_data = [list(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
-            QMessageBox.critical(self, "Ошибка БД", f"Ошибка при чтении данных из БД admin: {e}")
+            QMessageBox.critical(self, "Ошибка БД", f"Ошибка при чтении данных из БД: {e}")
             return
 
-        self.host = self.host_input.text()
-        self.user = self.username_input.text()
-        self.passw = self.password_input.text()
-        port_text = self.port_input.text()
-        is_admin = False
+        self.host = self.host_input.text().strip()
+        self.user = self.username_input.text().strip()
+        self.passw = self.password_input.text().strip()
+        port_text = self.port_input.text().strip()
+
+        if not all([self.host, self.user, self.passw]):
+            QMessageBox.warning(self, "Ошибка", "Заполните все обязательные поля")
+            return
 
         try:
-            # Перед подключением закрываем старое соединение
-            if self.ftp:
-                self.ftp_disconnect()
+            port = int(port_text) if port_text else 21
+        except ValueError:
+            QMessageBox.critical(self, "Ошибка", "Неверный формат порта")
+            return
 
-            for value_host in admin_data:
-                if self.host == value_host[0] and self.user == value_host[1] and self.passw == value_host[2]:
-                    is_admin = True
-                    break
+        if self.ftp:
+            self.ftp_disconnect()
 
-            try:
-                port = int(port_text) if port_text else 21
-            except ValueError:
-                QMessageBox.critical(self, "Ошибка", "Неверный формат порта.  Используется порт 21 по умолчанию.")
-                port = 21
+        # Проверка прав администратора
+        self.is_admin = any(
+            self.host == host and self.user == user and self.passw == psw
+            for host, user, psw in admin_data
+        )
 
+        try:
             self.ftp = ftplib.FTP(timeout=30)
-            self.ftp.set_pasv(True)
-            self.ftp.connect(self.host, port, timeout=30)
+            self.ftp.connect(self.host, port, timeout=15)
+            
+            # Проверка приветственного сообщения сервера
+            if not self.ftp.welcome.startswith('220'):
+                raise ConnectionError("Неверный ответ сервера")
+
             self.ftp.login(user=self.user, passwd=self.passw)
-            print(f"Пассивный режим включён: {self.ftp.passiveserver}")
-            QMessageBox.information(self, 'Подключение к серверу', 'Успешное подключение!')
-
-            self.ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self.ftp.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-            self.ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-
-            self.button_report_history.setVisible(True)
-            self.button_report.setVisible(True)
-            self.update()
-
+            
+            # Усиленная проверка соединения
             try:
-                Logger.loging(self.user,"Подключение",  f"Сервер: {self.host}")
+                self.ftp.voidcmd("NOOP")
+                self.ftp.sendcmd("PWD")
             except Exception as e:
-                print(f'Не удалось записать в лог: {str(e)}')
+                raise ConnectionError(f"Соединение нестабильно: {str(e)}")
 
-            self.ftp_file_model = FTPFileModel(self, self.current_directory, self.ftp)
+            # Настройка сокета
+            if self.ftp.sock:
+                sock = self.ftp.sock
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            else:
+                raise ConnectionError("Не удалось получить сокет FTP")
+
+            # Инициализация модели файлов
+            self.ftp_file_model = FTPFileModel(self, '/', self.ftp)
             self.serv_file_tree.setModel(self.ftp_file_model)
+            self.button_report.setVisible(self.is_admin)
+            self.button_report_history.setVisible(self.is_admin)
             self.update_server_tree()
-            self.serv_location.setText(self.current_directory)
+            self.serv_location.setText('/')
 
-        except ftplib.all_errors as e:
-            QMessageBox.critical(self, 'Ошибка FTP', f'Ошибка FTP: {str(e)}')
+            # Определение корневого пути
+            try:
+                original_dir = self.ftp.pwd()
+                test_dir = "test_dir_123"
+                try:
+                    self.ftp.mkd(test_dir)
+                    self.ftp.rmd(test_dir)
+                    self.physical_ftp_path = original_dir
+                except:
+                    self.physical_ftp_path = '/'
+                self.ftp.cwd(original_dir)
+            except Exception as e:
+                print(f"Определение корня: {e}")
+                self.physical_ftp_path = '/'
+
+            QMessageBox.information(self, 'Успех', 'Подключение установлено')
+            Logger.loging(self, "Подключение", f"Сервер: {self.host}")
+
+        except ftplib.error_perm as e:
+            error_code = e.args[0].split()[0]
+            if error_code == '530':
+                QMessageBox.critical(self, 'Ошибка', 'Неверные учетные данные')
+            else:
+                QMessageBox.critical(self, 'Ошибка', f"Код ошибки: {error_code}")
+            self.ftp_disconnect()
+            
+        except (socket.timeout, ConnectionRefusedError) as e:
+            QMessageBox.critical(self, 'Ошибка', 'Таймаут подключения')
+            self.ftp_disconnect()
+            
         except Exception as e:
-            QMessageBox.critical(self, 'Ошибка', f'Не удалось подключиться к FTP-серверу: {str(e)}')
+            QMessageBox.critical(self, 'Ошибка', f"{type(e).__name__}: {str(e)}")
+            self.ftp_disconnect()
+            
+        finally:
+            QApplication.processEvents()
+
 
     def ftp_disconnect(self):
         if self.ftp:
-            Logger.loging(self.user, "Отключение", "От сервера FTP")
+            Logger.loging(self, "Отключение", "От сервера FTP")
             try:
-                self.ftp.quit()
-                self.ftp = None
+                try:
+                    self.ftp.quit()
+                except:
+                    try:
+                        self.ftp.close()
+                    except:
+                        pass
+                
                 QMessageBox.information(self, 'Отключение', 'Отключение произошло успешно')
-            except ftplib.all_errors as e:
+            except Exception as e:
                 QMessageBox.warning(self, 'Ошибка отключения', f'Ошибка при отключении: {str(e)}')
             finally:
+                self.ftp = None
                 self.current_directory = '/'
                 self.serv_location.setText('')
                 self.serv_file_tree.setModel(None)
-                self.host_input.setText('')
-                self.username_input.setText('')
-                self.port_input.setText('')
-                self.password_input.setText('')
                 self.button_report_history.setVisible(False)
                 self.button_report.setVisible(False)
+                
+                # Очищаем список пользователей при отключении
+                self.user_list.clear()
 
     def update_server_tree(self):
         """Полное обновление дерева сервера"""
@@ -316,7 +365,7 @@ class FTPClient(QMainWindow):
             return
 
         self.is_double_click_processing = True
-        
+
         try:
             if not self.ftp or not self.ftp_file_model or not index.isValid():
                 return
@@ -334,19 +383,19 @@ class FTPClient(QMainWindow):
                 try:
                     # Сохраняем текущий путь перед изменением
                     old_path = self.ftp.pwd()
-                    
+
                     # Переходим в новую директорию
                     self.ftp.cwd(new_path)
                     self.current_directory = new_path
-                    
+
                     # Полностью перезагружаем модель
                     self.ftp_file_model.root_path = new_path
                     self.ftp_file_model.load_data()
-                    
+
                     # Обновляем интерфейс
                     self.serv_location.setText(new_path)
                     self.serv_file_tree.viewport().update()
-                    
+
                 except ftplib.error_perm as e:
                     QMessageBox.warning(self, 'Ошибка', f'Нет доступа: {e}')
                     # Восстанавливаем предыдущий путь
@@ -357,7 +406,7 @@ class FTPClient(QMainWindow):
             else:
                 full_path = os.path.join(self.current_directory, item_name).replace('\\', '/')
                 self.serv_location.setText(full_path)
-                
+
         except Exception as e:
             QMessageBox.critical(self, 'Ошибка', f'Ошибка при обработке: {str(e)}')
         finally:
@@ -400,15 +449,108 @@ class FTPClient(QMainWindow):
         event.accept()
 
     def open_history_report(self):
-        try: 
+        try:
             history_file = "history_adv.xls"
             if os.path.exists(history_file):
                 os.startfile(history_file)
             else:
                 QMessageBox.information(self, "Информация", "Файл с историей действий не создан ")
-        except Exception as e: 
+        except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл истории: {str(e)}")
 
+    def file_exists(self, path):
+        try:
+            self.ftp.size(path)
+            return True
+        except:
+            return False
+
+    def setup_user_panel(self):
+        self.user_dock = QDockWidget("Активные пользователи", self)
+        self.user_list = QListWidget()
+        self.user_dock.setWidget(self.user_list)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.user_dock)
+        self.user_dock.hide()
+
+    def show_active_users(self):
+        if not self.ftp:
+            QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к серверу")
+            return
+
+        try:
+            # Альтернативный способ для серверов, не поддерживающих SITE WHO
+            self.user_list.clear()
+            
+            # Попробуем получить список файлов в специальной директории
+            try:
+                self.ftp.cwd('/active_users')  # Может не существовать
+                files = []
+                self.ftp.retrlines('LIST', files.append)
+                
+                for line in files:
+                    if line.startswith('d'):
+                        continue  # Пропускаем директории
+                    username = line.split()[-1]
+                    self.user_list.addItem(username)
+                    
+            except ftplib.error_perm:
+                # Если директории нет, используем альтернативный метод
+                self.user_list.addItem("Сервер не поддерживает просмотр активных пользователей")
+                self.user_list.addItem(f"Текущий пользователь: {self.user}")
+                
+            self.user_dock.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось получить информацию: {str(e)}")
+
+    def show_history_report(self):
+        """Открытие отчета истории - скачивает all_logs.xls и открывает его"""
+        if not self.ftp:
+            QMessageBox.warning(self, "Ошибка", "Нет подключения к FTP серверу")
+            return
+
+        try:
+            # Создаем уникальное имя временного файла
+            temp_dir = tempfile.gettempdir()
+            temp_filename = os.path.join(temp_dir, f"ftp_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls")            
+            # Скачиваем файл с сервера
+            try:
+                with open(temp_filename, 'wb') as tmp_file:
+                    self.ftp.retrbinary('RETR /all_logs.xls', tmp_file.write)
+            except ftplib.error_perm:
+                QMessageBox.information(self, "Информация", "Файл с историей действий пока не создан")
+                return
+            
+            # Открываем файл
+            try:
+                # Для Windows
+                if os.name == 'nt':
+                    os.startfile(temp_filename)
+                else:
+                    # Для Linux/Mac
+                    opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                    subprocess.call([opener, temp_filename])
+                
+                # Удаляем файл через 30 секунд (даем время на работу с файлом)
+                QTimer.singleShot(30000, lambda: self._safe_delete_file(temp_filename))
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл: {str(e)}")
+                self._safe_delete_file(temp_filename)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось обработать запрос: {str(e)}")
+            self._safe_delete_file(temp_filename)
+
+    def _safe_delete_file(self, filename):
+        """Безопасное удаление файла с обработкой ошибок"""
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except Exception as e:
+            print(f"Не удалось удалить временный файл {filename}: {str(e)}")
+            # Пробуем еще раз через минуту
+            QTimer.singleShot(60000, lambda: self._safe_delete_file(filename))
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

@@ -1,0 +1,1237 @@
+main.py:
+```
+
+import sys
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeView, QFileSystemModel,QVBoxLayout, QWidget, QLineEdit, QPushButton, QMessageBox, QHBoxLayout, QLabel, QDockWidget, QListWidget)
+from PyQt5.QtCore import QDir, QSize, QTimer, Qt
+from PyQt5.QtGui import QStandardItemModel, QStandardItem, QIcon
+import ftplib
+import os
+import socket
+import sqlite3
+from serv_FM import FTPFileModel
+from Actions import Actions, Logger
+import tempfile
+import xlwt, xlrd
+from datetime import datetime
+import subprocess # Импортируем модуль subprocess
+
+class FTPClient(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        # Инициализация переменных
+        self.ftp = None
+        self.current_directory = '/'
+        self.local_directory = QDir.homePath()
+        self.database = sqlite3.connect("main_data.db")
+        self.ftp_file_model = None
+        self.upload_thread = None
+        self.is_double_click_processing = False
+        self.user = None
+        self.host = None
+        self.passw = None
+        self.is_admin = False
+        self.physical_ftp_path = '/'
+        self.connection_attempts = 0
+        self.max_retries = 3
+        self.user_dock = None
+        self.setup_user_panel()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('FTPWidget')
+        self.setGeometry(400, 100, 1300, 800)
+
+        # Создание виджетов
+        # Верхняя панель подключения
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText('IP хоста')
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText('Имя пользователя')
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText('Пароль')
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText('Порт')
+
+        self.highbox = QHBoxLayout()
+        self.connect_button = QPushButton('Подключиться')
+        self.connect_button.clicked.connect(self.connect_to_ftp)
+        self.disconnect_button = QPushButton('Отключиться')
+        self.disconnect_button.clicked.connect(self.ftp_disconnect)
+        self.highbox.addWidget(self.connect_button)
+        self.highbox.addWidget(self.disconnect_button)
+
+        # Кнопка назад на сервере
+        self.back_button = QPushButton()
+        self.back_button.clicked.connect(self.go_back)
+        back_button_icon = QIcon('pictures/back.png')
+        self.back_button.setIcon(back_button_icon)
+        self.back_button.setIconSize(QSize(20, 20))
+        self.back_button.setFixedSize(25, 25)
+
+        # Кнопка назад на локальном компьютере
+        self.back_button_loc = QPushButton()
+        self.back_button_loc.clicked.connect(self.go_back_loc)
+        self.back_button_loc.setIcon(back_button_icon)
+        self.back_button_loc.setIconSize(QSize(20, 20))
+        self.back_button_loc.setFixedSize(25, 25)
+
+        # Поля для отображения директорий
+        self.local_location = QLineEdit(self.local_directory)
+        self.local_location.setReadOnly(True)
+        self.serv_location = QLineEdit()
+        self.serv_location.setReadOnly(True)
+        self.local_label = QLabel("Локальный компьютер:")
+        self.serv_label = QLabel("FTP Сервер:")
+
+        # Дерево файлов локального компьютера
+        self.file_tree = QTreeView()
+        self.file_model = QFileSystemModel()
+        self.file_tree.setModel(self.file_model)
+        self.file_tree.setRootIndex(self.file_model.setRootPath(QDir.homePath()))
+
+        # Дерево файлов сервера
+        self.serv_file_tree = QTreeView()
+
+        # Создаем контейнеры для кнопок
+        local_buttons_container = QWidget()
+        local_buttons_layout = QHBoxLayout(local_buttons_container)
+
+        server_buttons_container = QWidget()
+        server_buttons_layout = QHBoxLayout(server_buttons_container)
+
+        # Кнопки для локального компьютера
+        self.button_delete_local = QPushButton('Удалить')
+        self.button_delete_local.clicked.connect(
+            lambda: Actions.Delete_Loc(self, self.local_location, self.file_tree, self.file_model)())
+        self.button_record = QPushButton('Записать на сервер')
+        self.button_record.clicked.connect(lambda: Actions.Record(self, self.local_location, self.serv_location)())
+        local_buttons_layout.addWidget(self.button_delete_local)
+        local_buttons_layout.addWidget(self.button_record)
+
+        # Кнопки для сервера
+        self.button_delete_server = QPushButton('Удалить')
+        self.button_delete_server.clicked.connect(lambda: Actions.Delete_Serv(self, self.serv_location, self)())
+        self.button_download = QPushButton('Скачать')
+        self.button_download.clicked.connect(lambda: Actions.Download(self, self.serv_location)())
+        server_buttons_layout.addWidget(self.button_delete_server)
+        server_buttons_layout.addWidget(self.button_download)
+
+        # Дополнительные кнопки
+        self.button_report_history = QPushButton('Отчёт истории')
+        self.button_report = QPushButton('Активные пользователи')
+        self.button_report.clicked.connect(self.show_active_users)
+        self.button_report_history.setVisible(False)
+        self.button_report.setVisible(False)
+        self.button_report_history.clicked.connect(self.show_history_report)
+
+        # Основной layout
+        main_layout = QVBoxLayout()
+
+        # Панель подключения
+        connection_layout = QHBoxLayout()
+        connection_layout.addWidget(self.host_input)
+        connection_layout.addWidget(self.username_input)
+        connection_layout.addWidget(self.password_input)
+        connection_layout.addWidget(self.port_input)
+        main_layout.addLayout(connection_layout)
+        main_layout.addLayout(self.highbox)
+
+        # Панель путей
+        paths_layout = QHBoxLayout()
+        paths_layout.addWidget(self.local_label)
+        paths_layout.addWidget(self.local_location)
+        paths_layout.addWidget(self.back_button_loc)
+        paths_layout.addWidget(self.serv_label)
+        paths_layout.addWidget(self.serv_location)
+        paths_layout.addWidget(self.back_button)
+        main_layout.addLayout(paths_layout)
+
+        # Панель файловых деревьев
+        files_layout = QHBoxLayout()
+        files_layout.addWidget(self.file_tree)
+        files_layout.addWidget(self.serv_file_tree)
+        main_layout.addLayout(files_layout)
+
+        # Панель кнопок действий
+        actions_layout = QHBoxLayout()
+
+        # Локальные кнопки (под левым деревом)
+        local_actions = QVBoxLayout()
+        local_actions.addWidget(QLabel("Действия с локальными файлами:"))
+        local_actions.addWidget(local_buttons_container)
+
+        # Серверные кнопки (под правым деревом)
+        server_actions = QVBoxLayout()
+        server_actions.addWidget(QLabel("Действия с файлами сервера:"))
+        server_actions.addWidget(server_buttons_container)
+
+        actions_layout.addLayout(local_actions)
+        actions_layout.addLayout(server_actions)
+        main_layout.addLayout(actions_layout)
+
+        # Дополнительные кнопки
+        other_buttons_layout = QHBoxLayout()
+        other_buttons_layout.addWidget(self.button_report)
+        other_buttons_layout.addWidget(self.button_report_history)
+        main_layout.addLayout(other_buttons_layout)
+
+        # Установка главного виджета
+        central_widget = QWidget()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
+
+        # Подключение сигналов
+        self.serv_file_tree.doubleClicked.connect(self.item_double_clicked_in_serv)
+        self.file_tree.doubleClicked.connect(self.item_double_clicked_in_local)
+
+    def connect_to_ftp(self):
+        admin_data = []
+        try:
+            with self.database as connection:
+                cursor = connection.cursor()
+                cursor.execute("SELECT ad_serv_host, admin_log, admin_psw FROM admin")
+                admin_data = [list(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Ошибка БД", f"Ошибка при чтении данных из БД: {e}")
+            return
+
+        self.host = self.host_input.text().strip()
+        self.user = self.username_input.text().strip()
+        self.passw = self.password_input.text().strip()
+        port_text = self.port_input.text().strip()
+
+        if not all([self.host, self.user, self.passw]):
+            QMessageBox.warning(self, "Ошибка", "Заполните все обязательные поля")
+            return
+
+        try:
+            port = int(port_text) if port_text else 21
+        except ValueError:
+            QMessageBox.critical(self, "Ошибка", "Неверный формат порта")
+            return
+
+        if self.ftp:
+            self.ftp_disconnect()
+
+        # Проверка прав администратора
+        self.is_admin = any(
+            self.host == host and self.user == user and self.passw == psw
+            for host, user, psw in admin_data
+        )
+
+        try:
+            # Новый блок подключения с улучшенной обработкой ошибок
+            self.ftp = ftplib.FTP(timeout=30)
+            self.ftp.connect(self.host, port, timeout=15)
+            
+            # Проверка приветственного сообщения сервера
+            if not self.ftp.welcome.startswith('220'):
+                raise ConnectionError("Неверный ответ сервера")
+
+            self.ftp.login(user=self.user, passwd=self.passw)
+            
+            # Усиленная проверка соединения
+            try:
+                self.ftp.voidcmd("NOOP")
+                self.ftp.sendcmd("PWD")
+            except Exception as e:
+                raise ConnectionError(f"Соединение нестабильно: {str(e)}")
+
+            # Настройка сокета
+            if self.ftp.sock:
+                sock = self.ftp.sock
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            else:
+                raise ConnectionError("Не удалось получить сокет FTP")
+
+            # Инициализация модели файлов
+            self.ftp_file_model = FTPFileModel(self, '/', self.ftp)
+            self.serv_file_tree.setModel(self.ftp_file_model)
+            self.button_report.setVisible(self.is_admin)
+            self.button_report_history.setVisible(self.is_admin)
+            self.update_server_tree()
+            self.serv_location.setText('/')
+
+            # Определение корневого пути
+            try:
+                original_dir = self.ftp.pwd()
+                test_dir = "test_dir_123"
+                try:
+                    self.ftp.mkd(test_dir)
+                    self.ftp.rmd(test_dir)
+                    self.physical_ftp_path = original_dir
+                except:
+                    self.physical_ftp_path = '/'
+                self.ftp.cwd(original_dir)
+            except Exception as e:
+                print(f"Определение корня: {e}")
+                self.physical_ftp_path = '/'
+
+            QMessageBox.information(self, 'Успех', 'Подключение установлено')
+            Logger.loging(self, "Подключение", f"Сервер: {self.host}")
+
+        except ftplib.error_perm as e:
+            error_code = e.args[0].split()[0]
+            if error_code == '530':
+                QMessageBox.critical(self, 'Ошибка', 'Неверные учетные данные')
+            else:
+                QMessageBox.critical(self, 'Ошибка', f"Код ошибки: {error_code}")
+            self.ftp_disconnect()
+            
+        except (socket.timeout, ConnectionRefusedError) as e:
+            QMessageBox.critical(self, 'Ошибка', 'Таймаут подключения')
+            self.ftp_disconnect()
+            
+        except Exception as e:
+            QMessageBox.critical(self, 'Ошибка', f"{type(e).__name__}: {str(e)}")
+            self.ftp_disconnect()
+            
+        finally:
+            QApplication.processEvents()
+
+
+    def ftp_disconnect(self):
+        if self.ftp:
+            Logger.loging(self, "Отключение", "От сервера FTP")
+            try:
+                try:
+                    self.ftp.quit()
+                except:
+                    try:
+                        self.ftp.close()
+                    except:
+                        pass
+                
+                QMessageBox.information(self, 'Отключение', 'Отключение произошло успешно')
+            except Exception as e:
+                QMessageBox.warning(self, 'Ошибка отключения', f'Ошибка при отключении: {str(e)}')
+            finally:
+                self.ftp = None
+                self.current_directory = '/'
+                self.serv_location.setText('')
+                self.serv_file_tree.setModel(None)
+                self.button_report_history.setVisible(False)
+                self.button_report.setVisible(False)
+                
+                # Очищаем список пользователей при отключении
+                self.user_list.clear()
+
+    def update_server_tree(self):
+        """Полное обновление дерева сервера"""
+        if not self.ftp or not self.ftp_file_model:
+            return
+
+        try:
+            current_path = self.ftp.pwd()
+            self.ftp_file_model.root_path = current_path
+            self.ftp_file_model.load_data()
+            self.serv_location.setText(current_path)
+            self.serv_file_tree.viewport().update()
+        except Exception as e:
+            QMessageBox.warning(self, 'Ошибка', f'Ошибка обновления: {str(e)}')
+
+    def force_refresh_server_tree(self):
+        """Принудительное обновление с задержкой"""
+        QTimer.singleShot(100, self.update_server_tree)
+
+    def setup_upload_thread(self, thread):
+        """Настройка обработчиков для потока загрузки"""
+        thread.finished.connect(lambda msg: QMessageBox.information(self, "Успех", msg))
+        thread.error.connect(lambda err: QMessageBox.critical(self, "Ошибка", err))
+        thread.update_needed.connect(self.force_refresh_server_tree)
+        self.upload_thread = thread
+
+    def _load_ftp_data(self):
+        if self.ftp and self.ftp_file_model:
+            self.ftp_file_model.root_path = self.current_directory
+            self.ftp_file_model.load_data()
+            self.serv_file_tree.viewport().update()
+
+    def item_double_clicked_in_local(self, index):
+        path = self.file_model.filePath(index)
+
+        if os.path.isfile(path):
+            self.local_location.setText(path)
+            self.local_directory = os.path.dirname(path)
+        elif os.path.isdir(path):
+            self.local_directory = path
+            self.local_location.setText(path)
+        else:
+            QMessageBox.warning(self, "Ошибка", "Неизвестный тип файла.")
+
+        self.file_tree.setRootIndex(self.file_model.setRootPath(self.local_directory))
+
+    def item_double_clicked_in_serv(self, index):
+        if self.is_double_click_processing:
+            return
+
+        self.is_double_click_processing = True
+
+        try:
+            if not self.ftp or not self.ftp_file_model or not index.isValid():
+                return
+
+            item = self.ftp_file_model.file_list[index.row()]
+            item_name = item['name']
+            is_dir = item['is_dir']
+
+            if item_name == '..':
+                self.go_back()
+                return
+
+            if is_dir:
+                new_path = os.path.join(self.current_directory, item_name).replace('\\', '/')
+                try:
+                    # Сохраняем текущий путь перед изменением
+                    old_path = self.ftp.pwd()
+
+                    # Переходим в новую директорию
+                    self.ftp.cwd(new_path)
+                    self.current_directory = new_path
+
+                    # Полностью перезагружаем модель
+                    self.ftp_file_model.root_path = new_path
+                    self.ftp_file_model.load_data()
+
+                    # Обновляем интерфейс
+                    self.serv_location.setText(new_path)
+                    self.serv_file_tree.viewport().update()
+
+                except ftplib.error_perm as e:
+                    QMessageBox.warning(self, 'Ошибка', f'Нет доступа: {e}')
+                    # Восстанавливаем предыдущий путь
+                    try:
+                        self.ftp.cwd(old_path)
+                    except:
+                        pass
+            else:
+                full_path = os.path.join(self.current_directory, item_name).replace('\\', '/')
+                self.serv_location.setText(full_path)
+
+        except Exception as e:
+            QMessageBox.critical(self, 'Ошибка', f'Ошибка при обработке: {str(e)}')
+        finally:
+            self.is_double_click_processing = False
+
+    def reset_double_click_flag(self):
+        self.is_double_click_processing = False
+
+    def go_back_loc(self):
+        current_path = self.local_directory
+        parent_path = os.path.dirname(current_path)
+
+        if parent_path:
+            self.local_directory = parent_path
+            self.local_location.setText(parent_path)
+            self.file_tree.setRootIndex(self.file_model.setRootPath(parent_path))
+
+    def go_back(self):
+        if self.current_directory != '/':
+            parent_directory = '/'.join(self.current_directory.split('/')[:-1]) or '/'
+            try:
+                self.ftp.cwd(parent_directory)
+                self.current_directory = self.ftp.pwd()
+                self.update_server_tree()
+                self.serv_location.setText(self.current_directory)
+            except ftplib.error_perm as e:
+                QMessageBox.warning(self, 'Ошибка', f'Нет доступа к родительской директории: {str(e)}')
+            except Exception as e:
+                QMessageBox.critical(self, 'Ошибка', f'Не удалось перейти в родительскую директорию: {str(e)}')
+        else:
+            QMessageBox.information(self, 'Информация', 'Вы уже находитесь в корневой директории.')
+
+    def closeEvent(self, event):
+        """Обработка закрытия окна"""
+        if self.ftp:
+            self.ftp_disconnect()
+        if hasattr(self, 'upload_thread') and self.upload_thread and self.upload_thread.isRunning():
+            self.upload_thread.quit()
+            self.upload_thread.wait()
+        event.accept()
+
+    def open_history_report(self):
+        try:
+            history_file = "history_adv.xls"
+            if os.path.exists(history_file):
+                os.startfile(history_file)
+            else:
+                QMessageBox.information(self, "Информация", "Файл с историей действий не создан ")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл истории: {str(e)}")
+
+    def file_exists(self, path):
+        try:
+            self.ftp.size(path)
+            return True
+        except:
+            return False
+
+    def setup_user_panel(self):
+        self.user_dock = QDockWidget("Активные пользователи", self)
+        self.user_list = QListWidget()
+        self.user_dock.setWidget(self.user_list)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.user_dock)
+        self.user_dock.hide()
+
+    def show_active_users(self):
+        if not self.ftp:
+            QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к серверу")
+            return
+
+        try:
+            # Альтернативный способ для серверов, не поддерживающих SITE WHO
+            self.user_list.clear()
+            
+            # Попробуем получить список файлов в специальной директории
+            try:
+                self.ftp.cwd('/active_users')  # Может не существовать
+                files = []
+                self.ftp.retrlines('LIST', files.append)
+                
+                for line in files:
+                    if line.startswith('d'):
+                        continue  # Пропускаем директории
+                    username = line.split()[-1]
+                    self.user_list.addItem(username)
+                    
+            except ftplib.error_perm:
+                # Если директории нет, используем альтернативный метод
+                self.user_list.addItem("Сервер не поддерживает просмотр активных пользователей")
+                self.user_list.addItem(f"Текущий пользователь: {self.user}")
+                
+            self.user_dock.show()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось получить информацию: {str(e)}")
+
+    def show_history_report(self):
+        """Открытие отчета истории - скачивает all_logs.xls и открывает его"""
+        if not self.ftp:
+            QMessageBox.warning(self, "Ошибка", "Нет подключения к FTP серверу")
+            return
+
+        try:
+            # Создаем уникальное имя временного файла
+            temp_dir = tempfile.gettempdir()
+            temp_filename = os.path.join(temp_dir, f"ftp_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls")            
+            # Скачиваем файл с сервера
+            try:
+                with open(temp_filename, 'wb') as tmp_file:
+                    self.ftp.retrbinary('RETR /all_logs.xls', tmp_file.write)
+            except ftplib.error_perm:
+                QMessageBox.information(self, "Информация", "Файл с историей действий пока не создан")
+                return
+            
+            # Открываем файл
+            try:
+                # Для Windows
+                if os.name == 'nt':
+                    os.startfile(temp_filename)
+                else:
+                    # Для Linux/Mac
+                    opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                    subprocess.call([opener, temp_filename])
+                
+                # Удаляем файл через 30 секунд (даем время на работу с файлом)
+                QTimer.singleShot(30000, lambda: self._safe_delete_file(temp_filename))
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл: {str(e)}")
+                self._safe_delete_file(temp_filename)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось обработать запрос: {str(e)}")
+            self._safe_delete_file(temp_filename)
+
+    def _safe_delete_file(self, filename):
+        """Безопасное удаление файла с обработкой ошибок"""
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except Exception as e:
+            print(f"Не удалось удалить временный файл {filename}: {str(e)}")
+            # Пробуем еще раз через минуту
+            QTimer.singleShot(60000, lambda: self._safe_delete_file(filename))
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    client = FTPClient()
+    client.show()
+    sys.exit(app.exec_())
+```
+Actions.py:
+```
+import os
+import ftplib
+from PyQt5.QtWidgets import QMessageBox, QInputDialog
+import shutil
+from PyQt5.QtCore import QThread, pyqtSignal
+import socket
+import xlrd
+import xlwt
+from datetime import datetime
+import tempfile
+
+
+class FTPUploadThread(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    update_needed = pyqtSignal()
+
+    def __init__(self, main_window, local_filepath, server_filepath):
+        super().__init__()
+        self.main_window = main_window
+        self.local_filepath = local_filepath
+        self.server_filepath = server_filepath
+        self.ftp = None
+        self.retries = 3
+
+    def run(self):
+        for attempt in range(self.retries):
+            try:
+                if not self.main_window.ftp:
+                    self.main_window.connect_to_ftp()
+                    
+                self.ftp = self.main_window.ftp
+                if not self.ftp:
+                    continue
+
+                # Устанавливаем таймаут на сокете (если он существует)
+                if hasattr(self.ftp, 'sock') and self.ftp.sock:
+                    self.ftp.sock.settimeout(15)  # 15 секунд таймаут
+
+                with open(self.local_filepath, 'rb') as f:
+                    # Убираем параметр timeout из storbinary
+                    self.ftp.storbinary(f'STOR {self.server_filepath}', f)
+                    
+                self.finished.emit("Файл успешно загружен")
+                self.update_needed.emit()
+                return
+                
+            except (socket.timeout, ConnectionResetError):
+                if attempt < self.retries-1:
+                    self.main_window.ftp_disconnect()
+                    self.main_window.connect_to_ftp()
+                continue
+                
+            except Exception as e:
+                self.error.emit(f"Ошибка: {str(e)}")
+                return
+
+        self.error.emit("Не удалось загрузить файл после нескольких попыток")
+        self.update_needed.emit()
+
+class Actions:
+
+    @staticmethod
+    def Download(main_window, serv_location):
+        def download_action():
+            filename = serv_location.text()
+            Logger.loging(main_window,"Скачивание", f"Файл: {filename}")
+
+            if not filename:
+                QMessageBox.warning(main_window, "Внимание", "Не выбран файл для скачивания.")
+                return
+
+            filepath_on_server = filename  # Используем уже полный путь
+            file_name = os.path.basename(filename)
+
+            if not file_name:
+                QMessageBox.warning(main_window, "Внимание", "Не удалось получить имя файла.")
+                return
+
+            local_filepath = os.path.join(main_window.local_directory, file_name)
+
+            try:
+                with open(local_filepath, 'wb') as local_file:
+                    main_window.ftp.retrbinary(f'RETR {filepath_on_server}', local_file.write)
+                QMessageBox.information(main_window, "Успех",
+                                          f"Файл '{file_name}' успешно скачан в '{main_window.local_directory}'.")
+                main_window.update_server_tree()
+
+            except ftplib.error_perm as e:
+                QMessageBox.critical(main_window, 'Ошибка скачивания', f'Ошибка доступа к файлу: {str(e)}')
+            except ftplib.error_temp as e:
+                QMessageBox.critical(main_window, 'Ошибка скачивания',
+                                       f'Временная ошибка при скачивании файла: {str(e)}')
+            except ftplib.error_proto as e:
+                QMessageBox.critical(main_window, 'Ошибка скачивания',
+                                       f'Протокольная ошибка при скачивании файла: {str(e)}')
+            except Exception as e:
+                QMessageBox.critical(main_window, 'Ошибка', f'Не удалось скачать файл: {str(e)}')
+
+        return download_action
+
+    @staticmethod
+    def Record(main_window, local_location, server_location):
+        def recording():
+            local_filepath = local_location.text()
+            server_filepath = server_location.text()
+
+            if not local_filepath:
+                QMessageBox.warning(main_window, "Внимание", "Не выбран локальный файл для записи.")
+                return
+
+            default_filename = os.path.basename(local_filepath)
+
+            file_name, ok = QInputDialog.getText(main_window, "Имя файла","Введите имя файла для сохранения на сервере:",text=default_filename)
+            if not ok or not file_name:
+                return
+
+            Logger.loging(main_window, "Загрузка на сервер", f"Локальный файл. {file_name} загружен в {server_filepath}")
+
+            server_filepath = os.path.join(main_window.current_directory, file_name).replace('\\', '/')
+
+            # Создаем и настраиваем поток
+            upload_thread = FTPUploadThread(main_window, local_filepath, server_filepath)
+            main_window.setup_upload_thread(upload_thread)
+            upload_thread.start()
+
+        return recording
+
+    @staticmethod
+    def Delete_Serv(main_window, serv_location, parent):
+        def delete_action_serv():
+            filename = serv_location.text()
+            Logger.loging(main_window,"Удаление с сервера", f"Файл: {filename}")
+
+            if not filename:
+                QMessageBox.warning(main_window, "Внимание", "Не выбран файл для удаления на сервере.")
+                return
+
+            filepath_on_server = filename  # Используем полный путь
+
+            try:
+                main_window.ftp.delete(filepath_on_server)
+                QMessageBox.information(main_window, "Успех",
+                                          f"Файл '{os.path.basename(filepath_on_server)}' успешно удален с сервера.")
+                main_window.update_server_tree()
+                serv_location.setText(main_window.current_directory)
+
+            except ftplib.error_perm as e:
+                QMessageBox.critical(main_window, 'Ошибка удаления', f'Ошибка доступа при удалении файла: {str(e)}')
+            except ftplib.error_temp as e:
+                QMessageBox.critical(main_window, 'Ошибка удаления', f'Временная ошибка при удалении файла: {str(e)}')
+            except ftplib.error_proto as e:
+                QMessageBox.critical(main_window, 'Ошибка удаления', f'Протокольная ошибка при удалении файла: {str(e)}')
+            except Exception as e:
+                QMessageBox.critical(main_window, 'Ошибка', f'Не удалось удалить файл: {str(e)}')
+
+        return delete_action_serv
+
+    @staticmethod
+    def Delete_Loc(main_window, local_location, file_tree, file_model):
+        def delete_action_loc():
+            filepath_on_local = local_location.text()
+            Logger.loging(main_window,"Удаление локального файла", f"Путь: {os.path.basename(filepath_on_local)}")
+
+            if not filepath_on_local:
+                QMessageBox.warning(main_window, "Внимание", 'Не выбран путь для удаления на локальной машине.')
+                return
+
+            if not os.path.exists(filepath_on_local):
+                QMessageBox.warning(main_window, 'Ошибка', f"Файл не существует: {filepath_on_local}")
+                return
+
+            try:
+                if os.path.isfile(filepath_on_local):
+                    os.remove(filepath_on_local)
+                    QMessageBox.information(main_window, "Успех",
+                                              f"Файл '{os.path.basename(filepath_on_local)}', успешно удалён с локальной машины.")
+                elif os.path.isdir(filepath_on_local):
+                    shutil.rmtree(filepath_on_local)
+                    QMessageBox.information(main_window, 'Успех',
+                                              f"Директория '{filepath_on_local}' успешно удалёна с локальной машины.")
+                else:
+                    QMessageBox.warning(main_window, "Ошибка", "Неизвестный тип объекта для удаления.")
+                    return
+
+                file_tree.setRootIndex(file_model.setRootPath(os.path.dirname(filepath_on_local)))
+
+            except PermissionError as e:
+                QMessageBox.critical(main_window, 'Ошибка прав', f'Нет прав для удаления: {str(e)}')
+            except OSError as e:
+                QMessageBox.critical(main_window, 'Ошибка системы', f'Ошибка при удалении: {str(e)}')
+            except Exception as e:
+                QMessageBox.critical(main_window, 'Ошибка', f'Не удалось удалить: {str(e)}')
+
+        return delete_action_loc
+
+# Actions.py (полностью переработанный класс Logger)
+class Logger:
+    @staticmethod
+    def loging(ftp_client, action, details):
+        """Основной метод логирования для всех пользователей"""
+        try:
+            if not ftp_client.ftp:
+                return
+
+            if ftp_client.is_admin:
+                Logger._admin_logging(ftp_client, action, details)
+            else:
+                Logger._user_logging(ftp_client, action, details)
+                
+        except Exception as e:
+            print(f"Ошибка логирования: {str(e)}")
+
+    @staticmethod
+    def _user_logging(ftp_client, action, details):
+        """Логирование для обычных пользователей"""
+        log_filename = ".user_logs.xls"
+        log_path = f"/{log_filename}"
+        
+        # Создаем уникальное имя временного файла
+        temp_dir = tempfile.gettempdir()
+        temp_filename = os.path.join(temp_dir, f"ftp_userlog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls")
+        
+        try:
+            # Пытаемся скачать существующий файл логов
+            try:
+                with open(temp_filename, 'wb') as tmp_file:
+                    ftp_client.ftp.retrbinary(f'RETR {log_path}', tmp_file.write)
+            except ftplib.error_perm:
+                pass  # Файла нет, создадим новый
+            
+            # Читаем существующие записи
+            existing_entries = []
+            if os.path.exists(temp_filename):
+                try:
+                    rb = xlrd.open_workbook(temp_filename)
+                    sheet = rb.sheet_by_index(0)
+                    
+                    for row in range(1, sheet.nrows):
+                        try:
+                            dt = datetime.strptime(sheet.cell_value(row, 0), "%Y-%m-%d %H:%M:%S")
+                            existing_entries.append({
+                                "datetime": dt,
+                                "action": sheet.cell_value(row, 1),
+                                "details": sheet.cell_value(row, 2)
+                            })
+                        except:
+                            continue
+                except:
+                    pass
+            
+            # Добавляем новую запись
+            existing_entries.append({
+                "datetime": datetime.now(),
+                "action": action,
+                "details": details
+            })
+            
+            # Сортируем записи
+            existing_entries.sort(key=lambda x: x["datetime"])
+            
+            # Создаем новый файл
+            wb = xlwt.Workbook()
+            ws = wb.add_sheet("Logs")
+            
+            # Заголовки
+            headers = ["Дата и время", "Действие", "Детали"]
+            for col, header in enumerate(headers):
+                ws.write(0, col, header)
+                
+            # Данные
+            for row, entry in enumerate(existing_entries, 1):
+                ws.write(row, 0, entry["datetime"].strftime("%Y-%m-%d %H:%M:%S"))
+                ws.write(row, 1, entry["action"])
+                ws.write(row, 2, entry["details"])
+            
+            # Сохраняем во временный файл
+            wb.save(temp_filename)
+            
+            # Загружаем на сервер
+            with open(temp_filename, 'rb') as f:
+                ftp_client.ftp.storbinary(f'STOR {log_path}', f)
+                
+        except Exception as e:
+            print(f"Ошибка при логировании пользователя: {str(e)}")
+        finally:
+            # Удаляем временный файл
+            if os.path.exists(temp_filename):
+                try:
+                    os.remove(temp_filename)
+                except:
+                    pass
+
+    @staticmethod
+    def _admin_logging(ftp_client, action, details):
+        """Логирование для администратора с дополнением существующего файла"""
+        temp_name = None
+        temp_download = None
+        try:
+            # 1. Сначала собираем все логи пользователей
+            user_logs = Logger._collect_user_logs(ftp_client)
+            
+            # 2. Добавляем текущее действие администратора
+            user_logs.append({
+                "datetime": datetime.now(),
+                "user": ftp_client.user,
+                "action": action,
+                "details": details
+            })
+            
+            # 3. Проверяем, существует ли файл all_logs.xls на сервере
+            existing_logs = []
+            temp_download = os.path.join(tempfile.gettempdir(), f"ftp_alllogs_temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls")
+            
+            try:
+                # Пытаемся скачать существующий файл
+                with open(temp_download, 'wb') as tmp_file:
+                    ftp_client.ftp.retrbinary('RETR /all_logs.xls', tmp_file.write)
+                
+                # Читаем существующие записи
+                rb = xlrd.open_workbook(temp_download)
+                sheet = rb.sheet_by_index(0)
+                
+                for row in range(1, sheet.nrows):
+                    try:
+                        dt = datetime.strptime(sheet.cell_value(row, 0), "%Y-%m-%d %H:%M:%S")
+                        existing_logs.append({
+                            "datetime": dt,
+                            "user": sheet.cell_value(row, 1),
+                            "action": sheet.cell_value(row, 2),
+                            "details": sheet.cell_value(row, 3)
+                        })
+                    except:
+                        continue
+                
+                # Добавляем существующие записи к новым
+                user_logs.extend(existing_logs)
+                
+            except ftplib.error_perm:
+                # Файла нет, это нормально - будем создавать новый
+                pass
+            except Exception as e:
+                print(f"Ошибка при чтении существующего файла логов: {str(e)}")
+            
+            # 4. Сортируем все записи по времени
+            user_logs.sort(key=lambda x: x["datetime"])
+            
+            # 5. Создаем новый файл с объединенными записями
+            temp_name = os.path.join(tempfile.gettempdir(), f"ftp_adminlog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls")
+            wb = xlwt.Workbook()
+            ws = wb.add_sheet("Logs")
+            
+            # Заголовки
+            headers = ["Дата и время", "Пользователь", "Действие", "Детали"]
+            for col, header in enumerate(headers):
+                ws.write(0, col, header)
+            
+            # Записи
+            for row, log in enumerate(user_logs, 1):
+                ws.write(row, 0, log["datetime"].strftime("%Y-%m-%d %H:%M:%S"))
+                ws.write(row, 1, log.get("user", "unknown"))
+                ws.write(row, 2, log["action"])
+                ws.write(row, 3, log["details"])
+            
+            wb.save(temp_name)
+            
+            # Загружаем на сервер
+            with open(temp_name, 'rb') as f:
+                ftp_client.ftp.storbinary('STOR /all_logs.xls', f)
+            
+        except Exception as e:
+            print(f"Ошибка при логировании администратора: {str(e)}")
+        finally:
+            # Удаляем временные файлы
+            for filename in [temp_name, temp_download]:
+                if filename and os.path.exists(filename):
+                    try:
+                        os.remove(filename)
+                    except:
+                        pass
+            
+            # 6. Удаляем файлы пользователей
+            Logger._cleanup_user_logs(ftp_client)
+
+    @staticmethod
+    def _collect_user_logs(ftp_client):
+        """Сбор всех логов пользователей с сервера"""
+        user_logs = []
+        
+        try:
+            # Сохраняем текущую директорию
+            original_dir = ftp_client.ftp.pwd()
+            
+            # Рекурсивный поиск файлов .user_logs.xls
+            def search_logs(path):
+                try:
+                    ftp_client.ftp.cwd(path)
+                    items = []
+                    ftp_client.ftp.retrlines('LIST', items.append)
+                    
+                    for item in items:
+                        parts = item.split()
+                        if not parts:
+                            continue
+                            
+                        name = parts[-1]
+                        is_dir = item.startswith('d')
+                        
+                        if is_dir and name not in ('.', '..'):
+                            # Рекурсивно проверяем поддиректории
+                            search_logs(name)
+                        elif name == '.user_logs.xls':
+                            # Нашли файл логов
+                            temp_name = os.path.join(tempfile.gettempdir(), 
+                                                   f"ftp_userlog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls")
+                            try:
+                                with open(temp_name, 'wb') as tmp:
+                                    ftp_client.ftp.retrbinary(f'RETR {name}', tmp.write)
+                                
+                                # Читаем логи из файла
+                                rb = xlrd.open_workbook(temp_name)
+                                sheet = rb.sheet_by_index(0)
+                                
+                                for row in range(1, sheet.nrows):
+                                    try:
+                                        dt = datetime.strptime(sheet.cell_value(row, 0), "%Y-%m-%d %H:%M:%S")
+                                        user_logs.append({
+                                            "datetime": dt,
+                                            "user": os.path.dirname(path) or "unknown",
+                                            "action": sheet.cell_value(row, 1),
+                                            "details": sheet.cell_value(row, 2)
+                                        })
+                                    except:
+                                        continue
+                                
+                            except Exception as e:
+                                print(f"Ошибка при обработке файла {name}: {str(e)}")
+                            finally:
+                                if os.path.exists(temp_name):
+                                    try:
+                                        os.remove(temp_name)
+                                    except:
+                                        pass
+                except ftplib.error_perm:
+                    pass  # Нет доступа к директории
+            
+            # Начинаем поиск с корня
+            search_logs('/')
+            
+            # Возвращаемся в исходную директорию
+            ftp_client.ftp.cwd(original_dir)
+            
+        except Exception as e:
+            print(f"Ошибка при сборе логов пользователей: {str(e)}")
+            
+        return user_logs
+    
+    @staticmethod
+    def _cleanup_user_logs(ftp_client):
+        """Удаление файлов логов пользователей после сбора"""
+        try:
+            file_list = []
+            ftp_client.ftp.retrlines('LIST', file_list.append)
+            
+            for line in file_list:
+                if line.strip().endswith('.user_logs.xls'):
+                    filename = line.split()[-1]
+                    try:
+                        ftp_client.ftp.delete(f'/{filename}')
+                    except:
+                        continue
+                        
+        except Exception as e:
+            print(f"Ошибка при удалении логов пользователей: {str(e)}")
+```
+serv_FM.py:
+```
+from PyQt5.QtCore import QAbstractItemModel, QModelIndex, Qt, QVariant
+from PyQt5.QtGui import QIcon
+import ftplib
+import os
+
+
+class FTPFileModel(QAbstractItemModel):
+    def __init__(self, ftp_client, root_path="/", ftp=None):
+        super().__init__()
+        self.ftp_client = ftp_client
+        self.root_path = root_path
+        self.file_list = []
+        self.columns = ["Имя", "Размер", "Дата изменения", "Тип"]
+        self.ftp = ftp
+
+        self.folder_icon = QIcon("pictures/folder.png")
+        self.config_icon = QIcon("pictures/config.png")
+        self.excel_icon = QIcon("pictures/excel.png")
+        self.newfile_icon = QIcon("pictures/Newfile.png")
+        self.png_icon = QIcon("pictures/png.png")
+        self.txt_icon = QIcon("pictures/txt.png")
+        self.word_icon = QIcon("pictures/word.png")
+
+        self.load_data()
+
+    def load_data(self):
+        if self.ftp is None:
+            return
+
+        self.beginResetModel()
+        self.file_list = []
+
+        try:
+            # Получаем текущую директорию
+            current_dir = self.ftp.pwd()
+
+            # Пытаемся перейти в целевую директорию
+            try:
+                if self.root_path != current_dir:
+                    self.ftp.cwd(self.root_path)
+            except ftplib.error_perm as e:
+                print(f"Не удалось перейти в {self.root_path}: {e}")
+                self.endResetModel()
+                return
+
+            lines = []
+            try:
+                # Используем LIST -a для админа, обычный LIST для пользователей
+                if self.ftp_client.is_admin:
+                    self.ftp.retrlines('LIST -a', lambda x: lines.append(x))
+                else:
+                    self.ftp.retrlines('LIST', lambda x: lines.append(x))
+            except ftplib.error_perm as e:
+                print(f"Ошибка LIST: {e}")
+                self.endResetModel()
+                return
+
+            for line in lines:
+                try:
+                    # Пропускаем служебные строки и скрытые файлы для обычных пользователей
+                    if not line.strip() or (not self.ftp_client.is_admin and
+                                            any(part.startswith('.') for part in line.split()[-1:])):
+                        continue
+
+                    self.process_ftp_line(line)
+                except Exception as e:
+                    print(f"Ошибка обработки строки: {e}")
+                    continue
+
+            # Сортировка: сначала директории, потом файлы
+            self.file_list.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+
+            # Добавляем ".." если не в корне
+            if self.root_path != '/':
+                self.file_list.insert(0, {
+                    'name': '..',
+                    'size': 0,
+                    'last_modified': '',
+                    'is_dir': True
+                })
+
+        except Exception as e:
+            print(f"Критическая ошибка при загрузке данных: {e}")
+        finally:
+            self.endResetModel()
+
+    def process_ftp_line(self, line):
+        # Пропускаем пустые строки и строки суммарного размера
+        if not line.strip() or 'total ' in line.lower():
+            return
+            
+        parts = line.split()
+        if not parts:
+            return
+            
+        # Windows-style LIST
+        if line.startswith('d') or line.startswith('-'):
+            is_dir = parts[0].startswith('d')
+            try:
+                size = int(parts[4]) if not is_dir else 0
+            except (IndexError, ValueError):
+                size = 0
+            last_modified = ' '.join(parts[5:8]) if len(parts) >= 8 else ''
+            name = ' '.join(parts[8:]) if len(parts) > 8 else parts[-1]
+        # Unix-style LIST
+        else:
+            is_dir = len(parts) > 1 and parts[1].isdigit() and int(parts[1]) > 1
+            size = 0 if is_dir else (int(parts[4]) if len(parts) > 4 else 0)
+            last_modified = ' '.join(parts[5:8]) if len(parts) >= 8 else ''
+            name = parts[-1]
+
+        # Пропускаем текущий и родительский каталоги (они добавляются отдельно)
+        if name in ('.', '..'):
+            return
+
+        self.file_list.append({
+            'name': name,
+            'size': size,
+            'last_modified': last_modified,
+            'is_dir': is_dir
+        })
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self.file_list)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return QVariant()
+
+        row = index.row()
+        if row < 0 or row >= len(self.file_list):
+            return QVariant()
+
+        file_info = self.file_list[row]
+        name = file_info['name']
+        is_dir = file_info['is_dir']
+
+        if role == Qt.DisplayRole:
+            col = index.column()
+            if col == 0:
+                return name
+            elif col == 1:
+                return "<DIR>" if is_dir else f"{file_info['size']} bytes"
+            elif col == 2:
+                return file_info['last_modified']
+            elif col == 3:
+                return "Directory" if is_dir else "File"
+        elif role == Qt.DecorationRole and index.column() == 0:
+            if name == '..':
+                return QIcon('pictures/back.png')
+            if is_dir:
+                return self.folder_icon
+
+            ext = os.path.splitext(name)[1].lower()
+            if ext in (".dll", ".ini"):
+                return self.config_icon
+            elif ext == ".xlsx":
+                return self.excel_icon
+            elif ext == ".png":
+                return self.png_icon
+            elif ext == ".txt":
+                return self.txt_icon
+            elif ext in (".doc", ".docx"):
+                return self.word_icon
+            return self.newfile_icon
+
+        return QVariant()
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.columns[section]
+        return QVariant()
+
+    def index(self, row, column, parent=QModelIndex()):
+        if not self.hasIndex(row, column, parent):
+            return QModelIndex()
+        return self.createIndex(row, column, None)
+
+    def parent(self, index):
+        return QModelIndex()
+
+    def change_root(self, path):
+        self.root_path = path
+        self.load_data()
+
+    def refresh(self):
+        """Принудительное обновление списка файлов"""
+        self.load_data()
+```
